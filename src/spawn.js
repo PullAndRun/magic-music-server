@@ -20,10 +20,8 @@ const logger = logScope('spawn');
  */
 async function spawnStdout(cmd, args = []) {
 	return new Promise((resolve, reject) => {
-		let stdoutOffset = 0;
-		let stderrOffset = 0;
-		const stdout = Buffer.alloc(5 * 1e3 * 1e3);
-		const stderr = Buffer.alloc(5 * 1e3 * 1e3);
+		const stdout = [];
+		const stderr = [];
 		const spawn = child_process.spawn(cmd, args);
 
 		spawn.on('spawn', () => {
@@ -37,18 +35,18 @@ async function spawnStdout(cmd, args = []) {
 			else {
 				logger.debug(`process ${cmd} exited successfully`);
 				resolve({
-					stdout: stdout.slice(0, stdoutOffset),
-					stderr: stderr.slice(0, stderrOffset),
+					stdout: Buffer.concat(stdout),
+					stderr: Buffer.concat(stderr),
 				});
 			}
 		});
 
 		spawn.stdout.on('data', (stdoutPart) => {
-			stdoutOffset += stdoutPart.copy(stdout, stdoutOffset);
+			stdout.push(stdoutPart);
 		});
 		spawn.stderr.on('data', (stderrPart) => {
 			logger.warn(`[${cmd}][stderr] ${stderrPart}`);
-			stderrOffset += stderrPart.copy(stderr, stderrOffset);
+			stderr.push(stderrPart);
 		});
 	});
 }

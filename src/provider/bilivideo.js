@@ -102,11 +102,12 @@ const getBiliVideoHeader = async () => {
 	const url = 'https://www.bilibili.com';
 
 	return cs.cache('bilicookie', () =>
-		request('GET', url).then((response) =>
-			response.headers['set-cookie']
+		request('GET', url).then((response) => {
+			response.destroy();
+			return (response.headers['set-cookie'] || [])
 				.map((cookie) => cookie.split(';')[0])
-				.join('; ')
-		)
+				.join('; ');
+		})
 	);
 };
 

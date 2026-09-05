@@ -1,5 +1,7 @@
-const { DEFAULT_SOURCE } = require('../consts');
 const match = require('./match');
+
+const describeIntegration =
+	process.env.RUN_INTEGRATION_TESTS === 'true' ? describe : describe.skip;
 
 const songList = [
 	520521849, // Remix; https://music.163.com/song/520521849
@@ -9,7 +11,7 @@ const songList = [
 	33190502, // ACG; http://music.163.com/song/33190502
 ];
 
-describe('Test if the default sources can get any song', () => {
+describeIntegration('Test if the default sources can get any song', () => {
 	songList.map(
 		(song) =>
 			test(

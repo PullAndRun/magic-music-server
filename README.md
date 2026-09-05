@@ -122,6 +122,25 @@ yarn
 DEVELOPMENT=true yarn node app.js
 ```
 
+### 开发验证
+
+本仓库使用 Yarn 3，依赖版本以 `yarn.lock` 为准。开发和运行测试需使用 Node.js 20 或更新版本；建议使用 Node.js 24。
+
+```bash
+corepack yarn install --immutable
+corepack yarn test --runInBand
+corepack yarn build
+node app.js --help
+```
+
+默认测试使用本地 HTTP 服务，不依赖外部音源。B 站音源的在线验证单独运行，结果会受网络和音源状态影响：
+
+```bash
+corepack yarn test:integration
+```
+
+Yarn PnP 模式下，运行未打包的源码和 Windows 服务管理脚本请使用 `corepack yarn node`，例如 `corepack yarn node nw.js`。`node app.js` 使用已构建的版本；源码修改后需重新运行构建。
+
 ### BetterNCM 一键安装器
 
 请移步至 [RevivedUnblockInstaller](https://github.com/ReviveUnblockNCMInstaller/RevivedUnblockInstaller)。

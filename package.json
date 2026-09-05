@@ -14,7 +14,8 @@
 		"start": "cross-env node src/app.js -e https://music.163.com",
 		"build": "webpack",
 		"pkg": "pkg . --out-path=dist/",
-		"test": "jest"
+		"test": "jest",
+		"test:integration": "cross-env RUN_INTEGRATION_TESTS=true jest src/provider/bilivideo.test.js --runInBand"
 	},
 	"pkg": {
 		"assets": [
@@ -66,5 +67,10 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"packageManager": "yarn@3.8.7"
+	"packageManager": "yarn@3.8.7",
+	"allowScripts": {
+		"core-js@3.49.0": true,
+		"@swc/core@1.15.43": true,
+		"unrs-resolver@1.12.2": true
+	}
 }

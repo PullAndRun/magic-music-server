@@ -2,37 +2,48 @@ const { spawnStdout } = require('./spawn');
 const ProcessExitNotSuccessfully = require('./exceptions/ProcessExitNotSuccessfully');
 
 describe('spawnStdout()', () => {
-	it('can correctly receive stdout', async () => {
-		const { stdout } = await spawnStdout('node', ['-v']);
-		// "node -v" returns the form of "v[major].[minor].[patch]"
-		expect(stdout.toString('utf-8')[0]).toBe('v');
+	it('collects stdout', async () => {
+		const { stdout } = await spawnStdout(process.execPath, [
+			'-e',
+			'process.stdout.write("hello")',
+		]);
+
+		expect(stdout.toString()).toBe('hello');
 	});
 
-	// TODO: can correctly receive stderr
+	it('collects stderr', async () => {
+		const { stderr } = await spawnStdout(process.execPath, [
+			'-e',
+			'process.stderr.write("warning")',
+		]);
 
-	it("throws when the process doesn't exit successfully", async () => {
-		try {
-			await spawnStdout('node', ['NOT_EXIST.js']);
-		} catch (e) {
-			expect(e).toBeInstanceOf(ProcessExitNotSuccessfully);
-		}
+		expect(stderr.toString()).toBe('warning');
 	});
 
-	it("throws when the process doesn't exist", async () => {
-		try {
-			await spawnStdout('THIS_COMMAND_SHOULD_NOT_BE_EXISTANCE_5ca1facd');
-		} catch (e) {
-			expect(e).toBeDefined();
-			expect(e.code).toBe('ENOENT');
-		}
+	it('does not truncate output larger than 5 MB', async () => {
+		const { stdout } = await spawnStdout(process.execPath, [
+			'-e',
+			'process.stdout.write(Buffer.alloc(6000000, 97))',
+		]);
+		expect(stdout.equals(Buffer.alloc(6000000, 97))).toBe(true);
 	});
 
-	it("throws when we don't have the permission to execute this command", async () => {
-		try {
-			await spawnStdout(__dirname + '/testdata/test.sh');
-		} catch (e) {
-			expect(e).toBeDefined();
-			expect(e.code).toBe('EACCES');
-		}
+	it('rejects an unsuccessful process', async () => {
+		await expect(
+			spawnStdout(process.execPath, ['-e', 'process.exit(2)'])
+		).rejects.toBeInstanceOf(ProcessExitNotSuccessfully);
+	});
+
+	it('rejects a missing executable', async () => {
+		await expect(
+			spawnStdout('THIS_COMMAND_SHOULD_NOT_EXIST_5ca1facd')
+		).rejects.toMatchObject({ code: 'ENOENT' });
+	});
+
+	const testUnixOnly = process.platform === 'win32' ? it.skip : it;
+	testUnixOnly('rejects a file without execute permission', async () => {
+		await expect(
+			spawnStdout(`${__dirname}/testdata/test.sh`)
+		).rejects.toMatchObject({ code: 'EACCES' });
 	});
 });

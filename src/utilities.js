@@ -6,10 +6,29 @@
  * @return {boolean}
  */
 const isHost = (url, host) => {
-	// FIXME: Due to #118, we can only check the url
-	// 		  by .includes(). You are welcome to fix
-	//        it (CWE-20).
-	return url.includes(host);
+	const getHostname = (value) => {
+		if (typeof value !== 'string') return '';
+		const candidate = value.trim();
+		if (!candidate || candidate.startsWith('/')) return '';
+
+		try {
+			const parsed = new URL(
+				/^[a-z][a-z\d+.-]*:\/\//i.test(candidate)
+					? candidate
+					: `http://${candidate}`
+			);
+			return parsed.hostname.toLowerCase().replace(/\.$/, '');
+		} catch {
+			return '';
+		}
+	};
+
+	const hostname = getHostname(url);
+	const expected = getHostname(host);
+	return (
+		Boolean(hostname && expected) &&
+		(hostname === expected || hostname.endsWith(`.${expected}`))
+	);
 };
 
 /**
@@ -21,12 +40,16 @@ const isHost = (url, host) => {
  */
 const isHostWrapper = (url) => (host) => isHost(url, host);
 
-const cookieToMap = (cookie) => {
-	return cookie
-		.split(';')
-		.map((cookie) => cookie.trim().split('='))
-		.reduce((obj, [key, value]) => ({ ...obj, [key]: value }), {});
-};
+const cookieToMap = (cookie = '') =>
+	cookie.split(';').reduce((result, entry) => {
+		const separator = entry.indexOf('=');
+		if (separator <= 0) return result;
+
+		const key = entry.slice(0, separator).trim();
+		const value = entry.slice(separator + 1).trim();
+		if (key) result[key] = value;
+		return result;
+	}, {});
 
 const mapToCookie = (map) => {
 	return Object.entries(map)

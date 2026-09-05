@@ -1,83 +1,184 @@
-const { CancelRequest } = require('./cancel');
+const http = require('http');
+const zlib = require('zlib');
+const { CancelRequest, ON_CANCEL } = require('./cancel');
 const request = require('./request');
 const RequestCancelled = require('./exceptions/RequestCancelled');
 
 describe('request()', () => {
-	test('will throw RequestCancelled when the CancelRequest has been cancelled', async () => {
+	let server;
+	let baseUrl;
+	let onSlowRequest;
+
+	beforeAll((done) => {
+		server = http.createServer((req, res) => {
+			switch (req.url) {
+				case '/slow':
+					onSlowRequest();
+					break;
+				case '/redirect-slow':
+					res.writeHead(302, { location: '/slow' });
+					res.end();
+					break;
+				case '/stream':
+					res.write('partial');
+					break;
+				case '/json':
+					res.setHeader('content-type', 'application/json');
+					res.end(JSON.stringify({ ok: true }));
+					break;
+				case '/jsonp':
+					res.end('callback({"ok":true})');
+					break;
+				case '/gzip':
+					res.setHeader('content-encoding', 'gzip');
+					res.end(zlib.gzipSync('compressed'));
+					break;
+				case '/redirect':
+					res.writeHead(302, { location: '/text' });
+					res.end();
+					break;
+				case '/redirect-loop':
+					res.writeHead(302, { location: '/redirect-loop' });
+					res.end();
+					break;
+				case '/created':
+					res.writeHead(201, { 'x-test': 'created' });
+					res.end('created');
+					break;
+				default:
+					res.setHeader('x-test', 'local');
+					res.end('hello');
+			}
+		});
+		server.listen(0, '127.0.0.1', () => {
+			baseUrl = `http://127.0.0.1:${server.address().port}`;
+			done();
+		});
+	});
+
+	afterAll((done) => {
+		server.close(done);
+	});
+
+	test.each(['/slow', '/redirect-slow'])(
+		'cancels an in-flight request to %s',
+		async (path) => {
+			const cancellation = new CancelRequest();
+			onSlowRequest = () => cancellation.cancel();
+			await expect(
+				request(
+					'GET',
+					baseUrl + path,
+					undefined,
+					undefined,
+					null,
+					cancellation
+				)
+			).rejects.toBeInstanceOf(RequestCancelled);
+			expect(cancellation.listenerCount(ON_CANCEL)).toBe(0);
+		}
+	);
+
+	test('cancels a response body after headers arrive', async () => {
+		const cancellation = new CancelRequest();
+		const response = await request(
+			'GET',
+			`${baseUrl}/stream`,
+			undefined,
+			undefined,
+			null,
+			cancellation
+		);
+		const body = response.body();
+		cancellation.cancel();
+		await expect(body).rejects.toBeInstanceOf(RequestCancelled);
+		expect(cancellation.listenerCount(ON_CANCEL)).toBe(0);
+	});
+
+	test('removes cancellation listeners after reading a response', async () => {
+		const cancellation = new CancelRequest();
+		const response = await request(
+			'GET',
+			`${baseUrl}/text`,
+			undefined,
+			undefined,
+			null,
+			cancellation
+		);
+		await response.body();
+		expect(cancellation.listenerCount(ON_CANCEL)).toBe(0);
+	});
+
+	test('preserves the target port and query through an HTTP proxy', async () => {
+		const options = request.configure(
+			'GET',
+			new URL('http://example.com:8080/a?q=1'),
+			{},
+			new URL(baseUrl)
+		);
+		expect(options.path).toBe('http://example.com:8080/a?q=1');
+	});
+
+	test('rejects an already cancelled request', async () => {
 		const cancelRequest = new CancelRequest();
 		cancelRequest.cancel();
 
-		try {
-			await request(
+		await expect(
+			request(
 				'GET',
-				'https://www.example.com',
+				`${baseUrl}/text`,
 				undefined,
 				undefined,
 				undefined,
 				cancelRequest
-			);
-		} catch (e) {
-			console.log(e);
-			expect(e).toBeInstanceOf(RequestCancelled);
-			return;
-		}
-
-		throw new Error('It should not be fulfilled.');
+			)
+		).rejects.toBeInstanceOf(RequestCancelled);
 	});
 
-	test('will NOT throw RequestCancelled when the CancelRequest has not been cancelled', async () => {
-		const cancelRequest = new CancelRequest();
+	test('returns headers and exposes the final request URL', async () => {
+		const response = await request('GET', `${baseUrl}/text`);
 
-		return request(
-			'GET',
-			'https://www.example.com',
-			undefined,
-			undefined,
-			undefined,
-			cancelRequest
-		);
-	}, 15000);
+		expect(response.headers['x-test']).toBe('local');
+		expect(response.url).toBeInstanceOf(URL);
+		expect(response.url.href).toBe(`${baseUrl}/text`);
+		await response.body(false);
+	});
 
-	test('headers should be in the response', async () => {
-		const response = await request('GET', 'https://www.example.com');
+	test('returns text and raw response bodies', async () => {
+		const textResponse = await request('GET', `${baseUrl}/text`);
+		const rawResponse = await request('GET', `${baseUrl}/text`);
 
-		expect(response.headers).toBeDefined();
-	}, 15000);
+		expect(await textResponse.body(false)).toBe('hello');
+		expect(await rawResponse.body(true)).toEqual(Buffer.from('hello'));
+	});
 
-	test('.body(raw: false) should returns the string', async () => {
-		const response = await request('GET', 'https://www.example.com');
-		const body = await response.body(false);
+	test('decompresses and deserializes response bodies', async () => {
+		const compressedResponse = await request('GET', `${baseUrl}/gzip`);
+		const jsonResponse = await request('GET', `${baseUrl}/json`);
+		const jsonpResponse = await request('GET', `${baseUrl}/jsonp`);
 
-		expect(typeof body === 'string').toBeTruthy();
-	}, 15000);
+		expect(await compressedResponse.body(false)).toBe('compressed');
+		expect(await jsonResponse.json()).toEqual({ ok: true });
+		expect(await jsonpResponse.jsonp()).toEqual({ ok: true });
+	});
 
-	test('.body(raw: true) should returns the Buffer', async () => {
-		const response = await request('GET', 'https://www.example.com');
-		const body = await response.body(true);
+	test('follows relative redirects', async () => {
+		const response = await request('GET', `${baseUrl}/redirect`);
 
-		expect(body).toBeInstanceOf(Buffer);
-	}, 15000);
+		expect(response.url.href).toBe(`${baseUrl}/text`);
+		expect(await response.body(false)).toBe('hello');
+	});
 
-	// FIXME: re-enable after api.opensource.org becomes online
-	//
-	// test('.json() should returns the deserialized data', async () => {
-	// 	const response = await request(
-	// 		'GET',
-	// 		'https://api.opensource.org/licenses/'
-	// 	);
-	// 	const body = await response.json();
+	test('does not treat a 201 response as a redirect', async () => {
+		const response = await request('POST', `${baseUrl}/created`);
 
-	// 	expect(Array.isArray(body)).toBeTruthy();
-	// }, 15000);
+		expect(response.statusCode).toBe(201);
+		expect(await response.body(false)).toBe('created');
+	});
 
-	// test('.url should be the request URL', async () => {
-	// 	const response = await request(
-	// 		'GET',
-	// 		'https://api.opensource.org/licenses/'
-	// 	);
-
-	// 	expect(response.url).toStrictEqual(
-	// 		url.parse('https://api.opensource.org/licenses/')
-	// 	);
-	// }, 15000);
+	test('rejects redirect loops', async () => {
+		await expect(
+			request('GET', `${baseUrl}/redirect-loop`)
+		).rejects.toMatchObject({ code: 'ERR_TOO_MANY_REDIRECTS' });
+	});
 });

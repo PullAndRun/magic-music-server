@@ -1,15 +1,17 @@
 const zlib = require('zlib');
 const http = require('http');
 const https = require('https');
-const ON_CANCEL = require('./cancel');
+const { ON_CANCEL } = require('./cancel');
 const RequestCancelled = require('./exceptions/RequestCancelled');
 const { logScope } = require('./logger');
-const parse = require('url').parse;
-const format = require('url').format;
 
 const logger = logScope('request');
 const timeoutThreshold = 10 * 1000;
+const maxRedirects = 10;
 const translate = (host) => (global.hosts || {})[host] || host;
+const getPath = (url) =>
+	url.path || `${url.pathname || '/'}${url.search || ''}`;
+const formatUrl = (url) => url.href || url.toString();
 const create = (url, proxy) =>
 	(((typeof proxy === 'undefined' ? global.proxy : proxy) || url).protocol ===
 	'https:'
@@ -18,7 +20,7 @@ const create = (url, proxy) =>
 	).request;
 
 const configure = (method, url, headers, proxy) => {
-	headers = headers || {};
+	headers = { ...(headers || {}) };
 	proxy = typeof proxy === 'undefined' ? global.proxy : proxy;
 	if ('content-length' in headers) delete headers['content-length'];
 
@@ -47,11 +49,14 @@ const configure = (method, url, headers, proxy) => {
 		options.path =
 			url.protocol === 'https:'
 				? translate(url.hostname) + ':' + (url.port || 443)
-				: 'http://' + translate(url.hostname) + url.path;
+				: 'http://' +
+					translate(url.hostname) +
+					(url.port ? `:${url.port}` : '') +
+					getPath(url);
 	} else {
-		options.hostname = translate(url.hostname);
+		options.hostname = translate(url.hostname).replace(/^\[|\]$/g, '');
 		options.port = url.port || (url.protocol === 'https:' ? 443 : 80);
-		options.path = url.path;
+		options.path = getPath(url);
 	}
 	return options;
 };
@@ -62,7 +67,7 @@ const configure = (method, url, headers, proxy) => {
 
 /**
  * @template T
- * @typedef {{url: string, body: RequestExtensionBody, json: () => Promise<T>, jsonp: () => Promise<T>}} RequestExtension
+ * @typedef {{url: URL, body: RequestExtensionBody, json: () => Promise<T>, jsonp: () => Promise<T>}} RequestExtension
  */
 
 /**
@@ -73,6 +78,7 @@ const configure = (method, url, headers, proxy) => {
  * @param {unknown?} body
  * @param {unknown?} proxy
  * @param {CancelRequest?} cancelRequest
+ * @param {number} redirectCount
  * @return {Promise<http.IncomingMessage & RequestExtension<T>>}
  */
 const request = (
@@ -81,16 +87,19 @@ const request = (
 	receivedHeaders,
 	body,
 	proxy,
-	cancelRequest
+	cancelRequest,
+	redirectCount = 0
 ) => {
-	const url = parse(receivedUrl);
+	const url = new URL(receivedUrl);
+	if (cancelRequest?.cancelled)
+		return Promise.reject(new RequestCancelled(url.href));
 	/* @type {Partial<Record<string,string>>} */
-	const headers = receivedHeaders || {};
+	const headers = { ...(receivedHeaders || {}) };
 	const options = configure(
 		method,
 		url,
 		{
-			host: url.hostname,
+			host: url.host,
 			accept: 'application/json, text/plain, */*',
 			'accept-encoding': 'gzip, deflate',
 			'accept-language': 'zh-CN,zh;q=0.9',
@@ -104,59 +113,112 @@ const request = (
 	return new Promise((resolve, reject) => {
 		logger.debug(`Start requesting ${receivedUrl}`);
 
-		const clientRequest = create(url, proxy)(options);
+		let activeRequest = create(url, proxy)(options);
+		let activeResponse;
+		const cleanup = () =>
+			cancelRequest?.removeListener(ON_CANCEL, destroyClientRequest);
+		const finish = (handler) => (value) => {
+			cleanup();
+			handler(value);
+		};
 		const destroyClientRequest = function () {
-			// We destroy the request and throw RequestCancelled
-			// when the request has been cancelled.
-			clientRequest.destroy(new RequestCancelled(format(url)));
+			const error = new RequestCancelled(formatUrl(url));
+			activeResponse?.destroy(error);
+			activeRequest.destroy(error);
+		};
+		const receiveResponse = (response) => {
+			activeResponse = response;
+			response.once('end', cleanup);
+			response.once('close', cleanup);
+			response.once('error', cleanup);
+			resolve(response);
 		};
 
-		cancelRequest?.on(ON_CANCEL, destroyClientRequest);
+		cancelRequest?.once(ON_CANCEL, destroyClientRequest);
 		if (cancelRequest?.cancelled ?? false) destroyClientRequest();
 
-		clientRequest
+		activeRequest
 			.setTimeout(timeoutThreshold, () => {
 				logger.warn(
 					{
-						url: format(url),
+						url: formatUrl(url),
 					},
 					`The request timed out, or the requester didn't handle the response.`
 				);
-				destroyClientRequest();
+				const error = new Error(`Request timed out: ${formatUrl(url)}`);
+				error.code = 'ETIMEDOUT';
+				activeRequest.destroy(error);
 			})
-			.on('response', (response) => resolve(response))
-			.on('connect', (_, socket) => {
+			.on('response', receiveResponse)
+			.on('connect', (response, socket) => {
+				if (response.statusCode !== 200) {
+					socket.destroy();
+					const error = new Error(
+						`Proxy CONNECT failed: ${response.statusCode}`
+					);
+					error.code = 'ERR_PROXY_CONNECT';
+					finish(reject)(error);
+					return;
+				}
 				logger.debug(
 					'received CONNECT, continuing with https.request()...'
 				);
-				https
+				activeRequest = https
 					.request({
+						hostname: url.hostname.replace(/^\[|\]$/g, ''),
+						port: url.port || 443,
 						method: method,
-						path: url.path,
+						path: getPath(url),
 						headers: options._headers,
 						socket: socket,
 						agent: false,
 					})
-					.on('response', (response) => resolve(response))
-					.on('error', (error) => reject(error))
+					.setTimeout(timeoutThreshold, () => {
+						const error = new Error(
+							`Request timed out: ${formatUrl(url)}`
+						);
+						error.code = 'ETIMEDOUT';
+						activeRequest.destroy(error);
+					})
+					.on('response', receiveResponse)
+					.on('error', finish(reject))
 					.end(body);
 			})
-			.on('error', (error) => reject(error))
+			.on('error', finish(reject))
 			.end(options.method.toUpperCase() === 'CONNECT' ? undefined : body);
 	}).then(
 		/** @param {http.IncomingMessage} response */
 		(response) => {
-			if (cancelRequest?.cancelled ?? false)
-				return Promise.reject(new RequestCancelled(format(url)));
+			if (cancelRequest?.cancelled ?? false) {
+				response.destroy();
+				return Promise.reject(new RequestCancelled(formatUrl(url)));
+			}
 
-			if ([201, 301, 302, 303, 307, 308].includes(response.statusCode)) {
-				const redirectTo = url.resolve(
-					response.headers.location || url.href
-				);
+			if (
+				[301, 302, 303, 307, 308].includes(response.statusCode) &&
+				response.headers.location
+			) {
+				response.resume();
+				if (redirectCount >= maxRedirects) {
+					const error = new Error(
+						`Too many redirects while requesting ${formatUrl(url)}`
+					);
+					error.code = 'ERR_TOO_MANY_REDIRECTS';
+					return Promise.reject(error);
+				}
+				const redirectTo = new URL(response.headers.location, url).href;
 
 				logger.debug(`Redirect to ${redirectTo}`);
 				delete headers.host;
-				return request(method, redirectTo, headers, body, proxy);
+				return request(
+					method,
+					redirectTo,
+					headers,
+					body,
+					proxy,
+					cancelRequest,
+					redirectCount + 1
+				);
 			}
 
 			return Object.assign(response, {
@@ -171,6 +233,12 @@ const request = (
 
 const read = (connect, raw) =>
 	new Promise((resolve, reject) => {
+		if (connect.destroyed && !connect.readableEnded) {
+			reject(
+				connect.errored || new Error('Response stream was destroyed')
+			);
+			return;
+		}
 		const chunks = [];
 		connect
 			.on('data', (chunk) => chunks.push(chunk))

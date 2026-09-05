@@ -10,6 +10,7 @@ const RequestFailed = require('../exceptions/RequestFailed');
 const IncompleteAudioData = require('../exceptions/IncompleteAudioData');
 const { logScope } = require('../logger');
 const RequestCancelled = require('../exceptions/RequestCancelled');
+const { readFlacMetadata, selectPreferredAudio } = require('../audio-quality');
 
 const logger = logScope('provider/match');
 
@@ -27,7 +28,7 @@ const headerReferer = new Map([
 ]);
 
 /**
- * @typedef {{ size: number, br: number | null, url: string | null, md5: string | null, source: string }} AudioData
+ * @typedef {{ size: number, br: number | null, url: string | null, md5: string | null, source: string, format?: string, lossless?: boolean, sampleRate?: number, bitDepth?: number, channels?: number, duration?: number | null }} AudioData
  */
 
 /**
@@ -88,7 +89,7 @@ async function match(id, source, data) {
 		}
 
 		audioDataArr = audioDataArr.map((result) => result.value);
-		audioData = audioDataArr.reduce((a, b) => (a.br >= b.br ? a : b));
+		audioData = audioDataArr.reduce(selectPreferredAudio);
 	} else if (process.env.FOLLOW_SOURCE_ORDER) {
 		for (let i = 0; i < candidate.length; i++) {
 			const source = candidate[i];
@@ -128,6 +129,11 @@ async function match(id, source, data) {
 			audioId,
 			songName: name,
 			url,
+			source: audioData.source,
+			bitrate: audioData.br,
+			format: audioData.format,
+			sampleRate: audioData.sampleRate,
+			bitDepth: audioData.bitDepth,
 		},
 		`Replaced: [${audioId}] ${name}`
 	);
@@ -167,10 +173,22 @@ async function check(url) {
 
 	// Get the bitrate of this song.
 	const data = await response.body(true);
+	const contentRange = /^bytes \d+-\d+\/(\d+)$/i.exec(
+		headers['content-range'] || ''
+	);
+	song.size = contentRange
+		? Number(contentRange[1])
+		: response.statusCode === 200
+			? Number(headers['content-length']) || 0
+			: 0;
 
 	try {
-		const bitrate = decode(data);
-		song.br = bitrate && !isNaN(bitrate) ? bitrate * 1000 : null;
+		const flac = readFlacMetadata(data, song.size);
+		if (flac) Object.assign(song, flac);
+		else {
+			const bitrate = decode(data);
+			song.br = bitrate && !isNaN(bitrate) ? bitrate * 1000 : null;
+		}
 	} catch (e) {
 		logger.debug(e, 'Failed to decode and extract the bitrate');
 	}
@@ -209,13 +227,6 @@ async function check(url) {
 		if (isHost('126.net'))
 			song.md5 = song.url.split('/').slice(-1)[0].replace(/\..*/g, '');
 		if (isHost('qq.com')) song.md5 = headers['server-md5'];
-
-		// Set the size info of this song.
-		song.size =
-			parseInt(
-				(headers['content-range'] || '').split('/').pop() ||
-					headers['content-length']
-			) || 0;
 
 		// Check if the Content-Length equals 8192.
 		if (headers['content-length'] !== '8192') {
@@ -329,7 +340,6 @@ function decode(buffer) {
 	map[0] = map[2];
 
 	let pointer = 0;
-	if (buffer.slice(0, 4).toString() === 'fLaC') return 999;
 	if (buffer.slice(0, 3).toString() === 'ID3') {
 		pointer = 6;
 		const size = buffer

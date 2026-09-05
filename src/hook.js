@@ -699,6 +699,15 @@ const tryMatch = (ctx) => {
 		) {
 			return match(item.id)
 				.then((song) => {
+					if (item.code === 200 && item.url && !item.freeTrialInfo) {
+						// Client metadata does not establish the original FLAC bit depth
+						// or sample rate. Preserve it rather than assume an upgrade.
+						if (
+							item.type === 'flac' ||
+							(!song.lossless && (song.br || 0) <= (item.br || 0))
+						)
+							return null;
+					}
 					let os = '';
 					try {
 						let { header } = netease.param;
@@ -712,7 +721,7 @@ const tryMatch = (ctx) => {
 						);
 						os = header.os || cookie.os;
 					} catch (e) {}
-					item.type = song.br === 999000 ? 'flac' : 'mp3';
+					item.type = song.format || 'mp3';
 					if (os === 'pc' || os === 'uwp') {
 						item.url = global.endpoint
 							? `${global.endpoint.replace(
@@ -732,14 +741,15 @@ const tryMatch = (ctx) => {
 							: song.url;
 					}
 					item.md5 = song.md5 || crypto.md5.digest(song.url);
-					item.br = song.br || 128000;
+					item.br = song.br || (song.lossless ? 0 : 128000);
 					item.size = song.size;
 					item.code = 200;
 					item.freeTrialInfo = null;
 					return song;
 				})
 				.then((song) => {
-					if (!netease.path.includes('download') || song.md5) return;
+					if (!song || !netease.path.includes('download') || song.md5)
+						return;
 					const newer = (base, target) => {
 						const difference = Array.from([base, target])
 							.map((version) =>

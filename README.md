@@ -228,6 +228,18 @@ node app.js -o bilibili ytdlp
 | SEARCH_ALBUM          | bool | 在其他音源搜索歌曲时携带专辑名称（默认搜索条件 `歌曲名 - 歌手`，启用后搜索条件 `歌曲名 - 歌手 专辑名`） | `SEARCH_ALBUM=true`                                              |
 | NETEASE_COOKIE        | str  | 网易云 Cookie                                                                                           | `MUSIC_U=007554xxx`                                              |
 
+#### 高音质选择
+
+Windows 服务配置已启用 `ENABLE_FLAC=true`、`SELECT_MAX_BR=true` 和 `MIN_BR=999000`。原链接不可用、受限，或标注码率低于 999 kbps 时，会查询已配置的音源。该门槛不是音源必须满足的最低码率；无更高品质结果时，保留可正常播放的原链接。
+
+`SELECT_MAX_BR` 模式先选择已识别的 FLAC 无损，再比较位深、采样率，最后比较文件平均码率。日志中的 `bitDepth`、`sampleRate` 和 `bitrate` 可用于核对结果。FLAC 格式与码率分别识别，不再把所有 FLAC 都标成 999 kbps。
+
+文件平均码率由总大小和文件头中的时长估算，包含容器元数据；无损文件体积更大并不必然表示音质更好。读取文件头采用 [FLAC STREAMINFO 规范](https://www.rfc-editor.org/rfc/rfc9639.html#section-8.2)。规格只能说明文件编码参数，不能证明录音母带质量或是否经过升采样。
+
+2026-09-05 实测：酷我、波点提供的《晴天》文件为 24-bit / 44.1 kHz 双声道 FLAC，FFprobe 检测文件平均码率约 1,643 kbps。是否有 24-bit / 96 kHz 或更高规格取决于具体歌曲和音源，程序不会通过转码制造更高规格。
+
+当原链接已经是 FLAC、但客户端未提供其位深和采样率时，会保留原链接，以免仅凭压缩码率替换为较低规格文件。修改 `nw.js` 的环境变量后，已安装的 Windows 服务需要重新安装才会采用新设置。
+
 #### 日志等级 (`LOG_LEVEL`)
 
 这些是常用的值：

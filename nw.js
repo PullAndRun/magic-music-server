@@ -26,6 +26,10 @@ const svc = new Service({
 			value: 'true',
 		},
 		{
+			name: 'MIN_BR',
+			value: '999000',
+		},
+		{
 			name: 'DISABLE_UPGRADE_CHECK',
 			value: 'true',
 		},

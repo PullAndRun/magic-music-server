@@ -145,9 +145,20 @@ const proxy = {
 			}),
 		response: (ctx) => {
 			const { res, proxyRes } = ctx;
-			proxyRes.on('error', () =>
-				proxy.abort(proxyRes.socket, 'proxyRes')
-			);
+			const closeSockets = () => {
+				// A truncated upstream response must not leave the client waiting
+				// forever for the remaining audio bytes.
+				proxy.abort(proxyRes.socket, 'proxyRes');
+				proxy.abort(res.socket, 'res');
+			};
+			proxyRes.on('error', closeSockets);
+			proxyRes.on('aborted', closeSockets);
+			proxyRes.on('close', () => {
+				if (!proxyRes.readableEnded) closeSockets();
+			});
+			res.on('close', () => {
+				if (!res.writableEnded) proxy.abort(proxyRes.socket, 'res');
+			});
 			res.writeHead(proxyRes.statusCode, proxyRes.headers);
 			proxyRes.readable ? proxyRes.pipe(res) : res.end(proxyRes.body);
 		},

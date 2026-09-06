@@ -299,6 +299,9 @@ hook.request.before = (ctx) => {
 			const id = data[1].replace(/\.\w+/, '');
 			req.url = url.href;
 			req.headers['host'] = url.hostname;
+			// Audio clients use byte ranges. Compression would change the entity
+			// being ranged and can make the final response appear truncated.
+			req.headers['accept-encoding'] = 'identity';
 			req.headers['cookie'] = null;
 			ctx.package = { id };
 			ctx.decision = 'proxy';

@@ -10,6 +10,54 @@ const hook = require('./hook');
 const request = require('./request');
 const { isHost } = require('./utilities');
 
+const MEDIA_CONTENT_TYPE = /^(audio|video)\//i;
+const MEDIA_EXTENSION =
+	/\.(aac|flac|m4a|mp3|ogg|opus|wav|m4s|mp4|webm)(?:$|\?)/i;
+
+const parseContentLength = (value) => {
+	const length = Number(value);
+	return Number.isSafeInteger(length) && length >= 0 ? length : null;
+};
+
+const parseByteRange = (value) => {
+	const match = /^bytes=(\d+)-(\d*)$/i.exec(String(value || '').trim());
+	if (!match) return null;
+	const start = Number(match[1]);
+	const end = match[2] ? Number(match[2]) : null;
+	if (
+		!Number.isSafeInteger(start) ||
+		(end !== null && (!Number.isSafeInteger(end) || end < start))
+	)
+		return null;
+	return { start, end };
+};
+
+const parseContentRange = (value) => {
+	const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(
+		String(value || '').trim()
+	);
+	if (!match) return null;
+	const start = Number(match[1]);
+	const end = Number(match[2]);
+	const total = match[3] === '*' ? null : Number(match[3]);
+	if (
+		!Number.isSafeInteger(start) ||
+		!Number.isSafeInteger(end) ||
+		end < start
+	)
+		return null;
+	return { start, end, total };
+};
+
+const describeMediaUrl = (value) => {
+	try {
+		const url = new URL(value);
+		return `${url.host}${url.pathname}`;
+	} catch {
+		return 'audio stream';
+	}
+};
+
 const proxy = {
 	core: {
 		mitm: (req, res) => {
@@ -39,7 +87,13 @@ const proxy = {
 					.then(() => proxy.mitm.request(ctx))
 					.then(() => hook.request.after(ctx))
 					.then(() => proxy.mitm.response(ctx))
-					.catch(() => proxy.mitm.close(ctx));
+					.catch((error) => {
+						logger.debug(
+							{ err: error, url: describeMediaUrl(req.url) },
+							'MITM request failed.'
+						);
+						proxy.mitm.close(ctx);
+					});
 			}
 		},
 		tunnel: (req, socket, head) => {
@@ -145,6 +199,9 @@ const proxy = {
 			}),
 		response: (ctx) => {
 			const { res, proxyRes } = ctx;
+			res.writeHead(proxyRes.statusCode, proxyRes.headers);
+			if (proxyRes.readable && proxy.mitm.pipeMediaStream(ctx)) return;
+
 			const closeSockets = () => {
 				// A truncated upstream response must not leave the client waiting
 				// forever for the remaining audio bytes.
@@ -159,8 +216,298 @@ const proxy = {
 			res.on('close', () => {
 				if (!res.writableEnded) proxy.abort(proxyRes.socket, 'res');
 			});
-			res.writeHead(proxyRes.statusCode, proxyRes.headers);
 			proxyRes.readable ? proxyRes.pipe(res) : res.end(proxyRes.body);
+		},
+		// Some CDN connections stay open after a partial media body. Resume
+		// from the last received byte rather than making the user seek.
+		pipeMediaStream: (ctx) => {
+			const { req, res, proxyRes: firstResponse } = ctx;
+			const contentType = String(
+				firstResponse.headers['content-type'] || ''
+			);
+			const requestRange = req.headers.range
+				? parseByteRange(req.headers.range)
+				: null;
+			if (
+				req.method !== 'GET' ||
+				(req.headers.range && !requestRange) ||
+				(!MEDIA_CONTENT_TYPE.test(contentType) &&
+					!ctx.package &&
+					!MEDIA_EXTENSION.test(req.url))
+			)
+				return false;
+
+			const firstContentRange = parseContentRange(
+				firstResponse.headers['content-range']
+			);
+			const firstLength = parseContentLength(
+				firstResponse.headers['content-length']
+			);
+			const streamStart =
+				firstResponse.statusCode === 200
+					? 0
+					: (firstContentRange?.start ?? requestRange?.start ?? 0);
+			const streamEnd =
+				firstContentRange?.end ??
+				requestRange?.end ??
+				(firstLength !== null ? streamStart + firstLength - 1 : null);
+			const expectedBytes = firstLength;
+			let receivedBytes = 0;
+			let retries = 0;
+			let finished = false;
+			let idleTimer = null;
+			let currentAttempt = null;
+
+			const clearIdleTimer = () => {
+				if (idleTimer) clearInterval(idleTimer);
+				idleTimer = null;
+			};
+			const destroyCurrentAttempt = () => {
+				const response = currentAttempt?.response;
+				if (response && !response.destroyed) response.destroy();
+			};
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				clearIdleTimer();
+				if (!res.writableEnded) res.end();
+			};
+			const fail = (reason) => {
+				if (finished) return;
+				finished = true;
+				clearIdleTimer();
+				logger.error(
+					{
+						url: describeMediaUrl(req.url),
+						receivedBytes,
+						retries,
+						reason,
+					},
+					'Media stream recovery failed.'
+				);
+				destroyCurrentAttempt();
+				proxy.abort(res.socket, 'res');
+			};
+			const attachAttempt = (response) => {
+				const startedAt = Date.now();
+				const attempt = {
+					response,
+					settled: false,
+					lastProgressAt: startedAt,
+					windowStartedAt: startedAt,
+					windowStartBytes: receivedBytes,
+					paused: false,
+				};
+				currentAttempt = attempt;
+				const attemptFailed = (reason) => {
+					if (finished || attempt.settled) return;
+					attempt.settled = true;
+					clearIdleTimer();
+					response.destroy();
+					retry(reason);
+				};
+				const armIdleTimer = () => {
+					clearIdleTimer();
+					idleTimer = setInterval(() => {
+						if (finished || attempt.settled) return;
+						if (attempt.paused) return;
+						const now = Date.now();
+						const idleFor = now - attempt.lastProgressAt;
+						if (idleFor >= server.mediaStreamIdleTimeout) {
+							attemptFailed('upstream idle timeout');
+							return;
+						}
+						const windowElapsed = now - attempt.windowStartedAt;
+						if (
+							windowElapsed >= server.mediaStreamThroughputWindow
+						) {
+							const windowBytes =
+								receivedBytes - attempt.windowStartBytes;
+							const requiredBytes =
+								server.mediaStreamMinThroughput *
+								(windowElapsed / 1000);
+							if (windowBytes < requiredBytes) {
+								const kbps = Math.round(
+									windowBytes / (windowElapsed / 1000) / 1024
+								);
+								attemptFailed(
+									`upstream throughput too low (${kbps} KiB/s)`
+								);
+								return;
+							}
+							attempt.windowStartedAt = now;
+							attempt.windowStartBytes = receivedBytes;
+						}
+					}, server.mediaStreamWatchdogInterval);
+					idleTimer.unref?.();
+				};
+				response.on('data', (chunk) => {
+					if (finished || attempt.settled) return;
+					if (expectedBytes !== null) {
+						const remaining = expectedBytes - receivedBytes;
+						if (remaining <= 0) {
+							attempt.settled = true;
+							clearIdleTimer();
+							response.destroy();
+							finish();
+							return;
+						}
+						if (chunk.length > remaining)
+							chunk = chunk.subarray(0, remaining);
+					}
+					receivedBytes += chunk.length;
+					attempt.lastProgressAt = Date.now();
+					if (!res.write(chunk)) {
+						response.pause();
+						attempt.paused = true;
+						res.once('drain', () => {
+							if (!finished && !attempt.settled) {
+								attempt.paused = false;
+								attempt.lastProgressAt = Date.now();
+								attempt.windowStartedAt = Date.now();
+								attempt.windowStartBytes = receivedBytes;
+								response.resume();
+							}
+						});
+					}
+					if (
+						expectedBytes !== null &&
+						receivedBytes >= expectedBytes
+					) {
+						attempt.settled = true;
+						clearIdleTimer();
+						response.destroy();
+						finish();
+					}
+				});
+				response.once('end', () => {
+					if (finished || attempt.settled) return;
+					attempt.settled = true;
+					clearIdleTimer();
+					if (
+						expectedBytes !== null &&
+						receivedBytes < expectedBytes
+					) {
+						retry('upstream ended before content-length');
+					} else {
+						finish();
+					}
+				});
+				response.once('error', (error) =>
+					attemptFailed(error?.message || 'upstream response error')
+				);
+				response.once('aborted', () =>
+					attemptFailed('upstream response aborted')
+				);
+				response.once('close', () => {
+					if (!response.readableEnded)
+						attemptFailed('upstream response closed early');
+				});
+				armIdleTimer();
+			};
+			// Continue the existing downstream response with a new byte range.
+			const retry = (reason) => {
+				if (finished) return;
+				clearIdleTimer();
+				if (retries >= server.mediaStreamMaxRetries) {
+					fail(reason);
+					return;
+				}
+				retries++;
+				const nextStart = streamStart + receivedBytes;
+				const url = describeMediaUrl(req.url);
+				logger.warn(
+					{
+						url,
+						nextStart,
+						receivedBytes,
+						retries,
+						reason,
+					},
+					'Media stream stalled; reconnecting from the next byte.'
+				);
+				const headers = {
+					...req.headers,
+					'accept-encoding': 'identity',
+				};
+				delete headers['proxy-authorization'];
+				delete headers['content-length'];
+				if (nextStart > 0 || req.headers.range) {
+					headers.range = `bytes=${nextStart}-${
+						streamEnd === null ? '' : streamEnd
+					}`;
+				} else {
+					delete headers.range;
+				}
+				setTimeout(() => {
+					if (finished) return;
+					request(req.method, req.url, headers)
+						.then((response) => {
+							if (finished) {
+								response.destroy();
+								return;
+							}
+							const contentRange = parseContentRange(
+								response.headers['content-range']
+							);
+							if (
+								response.statusCode >= 300 &&
+								response.statusCode < 400
+							) {
+								response.destroy();
+								retry(`HTTP ${response.statusCode}`);
+								return;
+							}
+							if (nextStart > 0 && response.statusCode !== 206) {
+								response.destroy();
+								fail(
+									`upstream ignored Range with HTTP ${response.statusCode}`
+								);
+								return;
+							}
+							if (
+								nextStart > 0 &&
+								contentRange &&
+								contentRange.start !== nextStart
+							) {
+								response.destroy();
+								fail(
+									`upstream resumed at ${contentRange.start} instead of ${nextStart}`
+								);
+								return;
+							}
+							attachAttempt(response);
+						})
+						.catch((error) => {
+							if (finished) return;
+							logger.warn(
+								{
+									url,
+									retries,
+									err: error?.message || String(error),
+								},
+								'Media stream reconnect failed.'
+							);
+							retry('reconnect failed');
+						});
+				}, server.mediaStreamRetryDelay);
+			};
+
+			res.on('error', () => {
+				finished = true;
+				clearIdleTimer();
+				destroyCurrentAttempt();
+			});
+			res.on('close', () => {
+				if (!res.writableEnded) {
+					finished = true;
+					clearIdleTimer();
+					destroyCurrentAttempt();
+					proxy.abort(currentAttempt?.response?.socket, 'res');
+				}
+			});
+			attachAttempt(firstResponse);
+			return true;
 		},
 		close: (ctx) => {
 			proxy.abort(ctx.res.socket, 'mitm');
@@ -249,5 +596,11 @@ const server = {
 server.whitelist = [];
 server.blacklist = ['://127\\.\\d+\\.\\d+\\.\\d+', '://localhost'];
 server.authentication = null;
+server.mediaStreamIdleTimeout = 8 * 1000;
+server.mediaStreamWatchdogInterval = 500;
+server.mediaStreamThroughputWindow = 5 * 1000;
+server.mediaStreamMinThroughput = 12 * 1024;
+server.mediaStreamMaxRetries = 3;
+server.mediaStreamRetryDelay = 100;
 
 module.exports = server;
